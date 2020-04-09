@@ -62,7 +62,6 @@ class SubsetExtractorVisitor():
 
         for shape in source_schema["shapes"]:
             if shape["id"] == shape_id:
-                nodes_visited.append(item_json['id'])
                 visit_shape_expression(shape, callback_map)
         return self.subset
 
@@ -90,37 +89,57 @@ class SubsetExtractorVisitor():
 
     def _on_node_constraint(self, node, context):
         # we copy everything
-        #pdb.set_trace()
         self._allow_all_values_of_property(self.prop_id)
 
     def _on_shape_or(self, node, context):
         #pdb.set_trace()
-        for shape in node["shapeExprs"]:
-            if shape not in self.shapes_ids:
-                continue
-            #
-            # if self._is_predicate_wdt() or self._is_predicate_ps(): # wdt or ps
-            #     if prop_id not in self.item_json['claims']:
-            #         continue
-            #
-            #     for value in item_json['claims'][prop_id]:
-            #         next_node = value['mainsnak']['datavalue']['value']['id']
-            #         # TODO: avoid copying the same node again (e.g. human Q5 has father Q6 and father has child Q5)
-            #         self.copy_node_to_targetwb(next_node, source_schema, value_expression, languages)
-            # elif self._is_predicate_p(): # p
-            #     subset[prop_id] = {}
-            #     self.extract_subset_from_shape(item_json, source_schema, value_expression,
-            #                                    languages, current_predicate, subset[prop_id])
-            #     pass
-            # elif self._is_predicate_pq(): # pq
-            #     subset["qualifier"]
-            #     pass
-            # elif self._is_predicate_prov(): # prov
-            #     subset[prop_id] = {}
-            #     self.extract_subset_from_shape(item_json, source_schema, value_expression,
-            #                                    languages, current_predicate, subset[prop_id])
-            # elif self._is_predicate_pr(): # pr
-            #     self.subset["references"].append(prop_id)
+        filtered_shapes = list(filter(lambda shape: shape in self.shapes_ids, node["shapeExprs"]))
+        if self._is_predicate_wdt() or self._is_predicate_ps(): # wdt or ps
+            if self.prop_id not in self.item_json['claims']:
+                return
+
+            for shape in filtered_shapes:
+                self._on_entity_shape_expr(self.item_json['claims'][self.prop_id], shape)
+        elif self._is_predicate_p(): # p
+            if self.prop_id not in self.item_json['claims']:
+                return
+
+            self.subset[self.prop_id] = {'references': [], 'qualifiers': []}
+            for shape in filtered_shapes:
+                tmp_subset = {'references': [], 'qualifiers': []}
+                SubsetExtractorVisitor(self.subset_engine).\
+                    extract_subset_from_shape(self.item_json['claims'][self.prop_id],
+                                              self.source_schema, shape, self.languages,
+                                              self.current_predicate,
+                                              tmp_subset)
+                self.subset['references'] += tmp_subset['references']
+                self.subset['qualifiers'] += tmp_subset['qualifiers']
+        elif self._is_predicate_pq(): # pq
+            self.subset["qualifiers"].append(self.prop_id)
+            if 'qualifiers' not in self.item_json \
+               or self.prop_id not in self.item_json['qualifiers']:
+                return
+
+            for shape in filtered_shapes:
+                self._on_entity_shape_expr(self.item_json['qualifiers'][self.prop_id],
+                                           shape)
+        elif self._is_predicate_prov(): # prov
+            for shape in filtered_shapes:
+                new_references = []
+                SubsetExtractorVisitor(self.subset_engine).\
+                    extract_subset_from_shape(self.item_json, self.source_schema, shape,
+                                              self.languages, self.current_predicate,
+                                              new_references)
+                self.subset["references"] += new_references
+        elif self._is_predicate_pr(): # pr
+            self.subset["references"].append(self.prop_id)
+            if 'references' not in self.item_json \
+               or self.prop_id not in self.item_json['references']['snaks']:
+                return
+
+            for shape in filtered_shapes:
+                self._on_entity_shape_expr(self.item_json['references']['snaks'][self.prop_id],
+                                           shape)
 
     def _on_triple_constraint(self, node, context):
         self.current_predicate = node['predicate']
@@ -141,14 +160,7 @@ class SubsetExtractorVisitor():
             if self._is_predicate_wdt() or self._is_predicate_ps(): # wdt or ps
                 if self.prop_id not in self.item_json['claims']:
                     return
-
-                for value in self.item_json['claims'][self.prop_id]:
-                    next_node = value['mainsnak']['datavalue']['value']['id']
-
-                    if next_node not in self.subset_engine.nodes_to_copy:
-                        # TODO: avoid copying the same node again (e.g. human Q5 has father Q6 and father has child Q5)
-                        self.subset_engine.copy_node_to_targetwb(next_node, self.source_schema,
-                                                                 value_expression, self.languages)
+                self._on_entity_shape_expr(self.item_json['claims'][self.prop_id], value_expression)
             elif self._is_predicate_p(): # p
                 if self.prop_id not in self.item_json['claims']:
                     return
@@ -164,14 +176,9 @@ class SubsetExtractorVisitor():
                 if 'qualifiers' not in self.item_json \
                    or self.prop_id not in self.item_json['qualifiers']:
                     return
-
-                for qual_value in self.item_json['qualifiers'][self.prop_id]:
-                    next_node = qual_value['mainsnak']['datavalue']['value']['id']
-                    if next_node not in self.subset_engine.nodes_to_copy:
-                        self.subset_engine.copy_node_to_targetwb(next_node, self.source_schema,
-                                                                value_expression, self.languages)
+                self._on_entity_shape_expr(self.item_json['qualifiers'][self.prop_id],
+                                           value_expression)
             elif self._is_predicate_prov(): # prov
-                self.subset["references"] = []
                 SubsetExtractorVisitor(self.subset_engine).\
                     extract_subset_from_shape(self.item_json, self.source_schema, value_expression,
                                               self.languages, self.current_predicate,
@@ -181,31 +188,32 @@ class SubsetExtractorVisitor():
                 if 'references' not in self.item_json \
                    or self.prop_id not in self.item_json['references']['snaks']:
                     return
-
-                for ref_value in self.item_json['references']['snaks'][self.prop_id]:
-                    next_node = ref_value['mainsnak']['datavalue']['value']['id']
-                    self.subset_engine.copy_node_to_targetwb(next_node, self.source_schema,
-                                                             value_expression, self.languages)
+                self._on_entity_shape_expr(self.item_json['references']['snaks'][self.prop_id],
+                                           value_expression)
         else:
             # value expression pointing to node constraint, all values allowed
             self._allow_all_values_of_property(self.prop_id)
         print(f"TripleConstraint - Pred: {self.current_predicate} - Value: {value_expression}")
 
-    def _visit_shapes_exprs(self, shapes):
-        pass
+    def _on_entity_shape_expr(self, values, shape_expression):
+        for value in values:
+            next_node = value['mainsnak']['datavalue']['value']['id']
+            if next_node not in self.subset_engine.nodes_to_copy:
+                self.subset_engine.copy_node_to_targetwb(next_node, self.source_schema,
+                                                         shape_expression, self.languages)
 
     def _allow_all_values_of_property(self, property_id):
         if self._is_predicate_wdt() or self._is_predicate_p(): #wdt or p
             self.subset[property_id] = {}
         elif self._is_predicate_pq(): # pq
             self.subset["qualifiers"].append(property_id)
-        elif self._is_predicate_prov(): # prov
-            pdb.set_trace()
-            self.subset["references"] = []
         elif self._is_predicate_pr(): # pr
             self.subset["references"].append(property_id)
 
 class WikibaseEngine(object):
+
+    MAPPINGS_PROP_LABEL = "wbs_core mapping"
+    MAPPINGS_PROP_DESC = "Mapping to the source entity created automatically by the wbs_core module of wdi."
 
     def __init__(self, wbsource_url, wbsource_sparql_endpoint, target_login,
                  wbtarget_url, wbtarget_sparql_endpoint):
@@ -222,7 +230,9 @@ class WikibaseEngine(object):
         self.local_item_engine = wdi_core.WDItemEngine.wikibase_item_engine_factory(
             self.wbtarget_api, self.wbtarget_sparql)
         self.mappings_cache = {} # maps entity ids between source and target wibase
-        self.nodes_visited = []
+        self.nodes_to_copy = []
+        self._mappings_prop = self._get_or_create_mappings_prop()
+        self._load_mappings()
 
     @classmethod
     def extractPropertiesFrom(cls, schema_json):
@@ -307,7 +317,7 @@ class WikibaseEngine(object):
         subset_extractor = SubsetExtractorVisitor(self)
         subset_extractor.extract_subset_from_shape(item_json, source_schema, shape_id,
                                                    languages, "", subset)
-        pdb.set_trace()
+        #pdb.set_trace()
         item_id = self.createItem(item_json, languages, deep_copy=True, subset=subset)
         print(f"Finished. Target id of {node} -> {item_id}")
         self.nodes_to_copy.clear()
@@ -388,17 +398,11 @@ class WikibaseEngine(object):
                 print(f"Not supported datatype for property '{source_id}' from source.")
             return INVALID_PROP
 
-        self.mappings_cache[source_id] = new_item_id # update mappings
+        self._add_mapping_to_item(item, source_id, etype)
+        self.mappings_cache[source_id] = new_item_id # update mappings cache
 
-        if len(claims) == 0:
+        if len(claims) == 0 or not deep_copy:
             # no statements to add, we can finish
-            return new_item_id
-        elif not deep_copy:
-            # we don't want to add the statements, map target item to source
-            # maybe we need to add this statement even if we are deep copying
-            wd_mapping = wdi_core.WDUrl(value="http://www.wikidata.org/entity/"+source_id, prop_nr="P1")
-            item.update([wd_mapping], append_value=["P1"])
-            item.write(self.login, entity_type=etype)
             return new_item_id
 
         self._add_statements_to_item(item, etype, claims, languages, subset)
@@ -413,6 +417,11 @@ class WikibaseEngine(object):
 
     def existsItem(self, source_item_id):
         return self._get_target_id_of(source_item_id, etype='item') is not None
+
+    def _add_mapping_to_item(self, item, source_id, etype):
+        wd_mapping = wdi_core.WDUrl(value=f"{self.wbsource_url}/entity/"+source_id, prop_nr=self._mappings_prop)
+        item.update([wd_mapping], append_value=[self._mappings_prop])
+        item.write(self.login, entity_type=etype)
 
     def _add_statements_to_item(self, item, etype, claims, languages, subset, overwrite=False):
         item_data = []
@@ -517,6 +526,23 @@ class WikibaseEngine(object):
             print(f"Not recognized datatype '{datatype}'. Returning None...")
             return None
 
+    def _get_or_create_mappings_prop(self):
+        query_res = json.loads(requests.get(f"{self.wbtarget_url}/w/api.php?action=wbsearchentities" + \
+            f"&search={self.MAPPINGS_PROP_LABEL}&format=json&language=en&type=property").text)
+        if 'search' in query_res and len(query_res['search']) > 0:
+            for search_result in query_res['search']:
+                if search_result['label'] == self.MAPPINGS_PROP_LABEL and \
+                   search_result['description'] == self.MAPPINGS_PROP_DESC:
+                    self._mappings_prop = search_result['id']
+                    break
+        else:
+            mappings_item = self.local_item_engine(new_item=True)
+            mappings_item.set_label(self.MAPPINGS_PROP_LABEL, lang='en')
+            mappings_item.set_description(self.MAPPINGS_PROP_DESC, lang='en')
+            self._mappings_prop = mappings_item.write(self.login, entity_type='property',
+                                                      property_datatype='url')
+        return self._mappings_prop
+
     def _get_references_from(self, data, languages, subset):
         item_references = []
         if 'references' not in data:
@@ -565,24 +591,15 @@ class WikibaseEngine(object):
         return item_qualifiers
 
     def _get_target_id_of(self, source_item_id, etype, language='en'):
-        if source_item_id in self.mappings_cache:
-            return self.mappings_cache[source_item_id]
-        else:
-            return None
+        return self.mappings_cache[source_item_id] if source_item_id in self.mappings_cache else None
 
-        # TODO: implement this
+    def _load_mappings(self):
         query = f"PREFIX wdt: <{self.wbtarget_url}prop/direct/>"
-        query += """
-            SELECT ?item ?itemLabel ?wikidata_mapping WHERE {
-                ?item wdt:P1 ?wikidata_mapping .
-                SERVICE wikibase:label { bd:serviceParam wikibase:language "[AUTO_LANGUAGE],en". }
-            }
-        """
+        query += "SELECT ?target ?source WHERE { ?target wdt:" + self._mappings_prop + " ?source . }"
         for result in wdi_core.WDItemEngine.execute_sparql_query(query, endpoint=self.wbtarget_sparql)["results"]["bindings"]:
-            wikidata_id = result["wikidata_mapping"]["value"].replace("http://www.wikidata.org/entity", "")
-            self.mappings_cache[wikidata_id] = result["item"]["value"].replace(self.wbtarget_url+"entity/", "")
-
-        return self._get_target_id_of(source_item_id, etype, language)
+            source_id = result["source"]["value"].replace(f"{self.wbtarget_url}/entity", "")
+            target_id = result["target"]["value"].replace(f"{self.wbsource_url}/entity", "")
+            self.mappings_cache[source_id] = target_id
 
 
     def getNamespace(self, nsName):
@@ -633,7 +650,6 @@ class WikibaseEngine(object):
 
     def _is_prop_in_subset(self, prop_id, subset):
         if subset is None:
-            # all props allowed
             return True
 
         if isinstance(subset, dict) and len(subset) == 0:
