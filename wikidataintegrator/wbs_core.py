@@ -1,4 +1,5 @@
 from pyshex.utils.schema_loader import SchemaLoader
+from pyshex.shex_evaluator import ShExEvaluator
 from wikidataintegrator import wdi_core
 import json
 import pdb
@@ -49,10 +50,10 @@ class SubsetExtractorVisitor():
                                   languages, current_predicate, subset):
         self.current_predicate = current_predicate
         self.subset = subset
-        self.shapes_ids = [shape["id"] for shape in source_schema["shapes"] if shape["type"] == "Shape"]
         self.source_schema = source_schema
         self.languages = languages
         self.item_json = item_json
+        self.shapes_ids = [shape["id"] for shape in source_schema["shapes"] if shape["type"] == "Shape"]
 
         callback_map = {
             "TripleConstraint": self._on_triple_constraint,
@@ -125,12 +126,12 @@ class SubsetExtractorVisitor():
                                            shape)
         elif self._is_predicate_prov(): # prov
             for shape in filtered_shapes:
-                new_references = []
+                new_references = {'references': []}
                 SubsetExtractorVisitor(self.subset_engine).\
                     extract_subset_from_shape(self.item_json, self.source_schema, shape,
                                               self.languages, self.current_predicate,
                                               new_references)
-                self.subset["references"] += new_references
+                self.subset["references"] += new_references['references']
         elif self._is_predicate_pr(): # pr
             self.subset["references"].append(self.prop_id)
             if 'references' not in self.item_json \
@@ -232,6 +233,7 @@ class WikibaseEngine(object):
         self.mappings_cache = {} # maps entity ids between source and target wibase
         self.nodes_to_copy = []
         self._mappings_prop = self._get_or_create_mappings_prop()
+        # TODO: remove this comment when using it on wbstack
         self._load_mappings()
 
     @classmethod
@@ -285,31 +287,27 @@ class WikibaseEngine(object):
         :type languages: List[str]
         """
         model_json = self._load_schema(source_schema)
-
         #self.copyItems(model_json, languages)
         #self.copyProperties(model_json, languages)
 
-        # obtain nodes from query -> nodes
         nodes = []
         for result in wdi_core.WDItemEngine.execute_sparql_query(sparql_query, endpoint=self.wbsource_sparql_endpoint)["results"]["bindings"]:
             nodes.append(result["item"]["value"].replace(f"{self.wbsource_url}/entity/", ""))
 
-        pdb.set_trace()
-        # TODO: validate nodes against given schema -> validated nodes
-        #validated_nodes = [node for node in nodes if node._conforms_to_shape(source_schema)]
-
         final_mappings = {}
-        # copy each validated node to the target wb, writting just the properties and values that appear in the ShEx
         for node in nodes:
             target_id = self.copy_node_to_targetwb(node, model_json, model_json["start"], languages)
             final_mappings[node] = target_id
 
         print('Final mappings')
         for k, v in final_mappings.items():
-            print(f"{k} ---> {v}.")
+            print(f"{k} ---> {v}")
 
     def copy_node_to_targetwb(self, node, source_schema, shape_id, languages):
-        # TODO: validate nodo contra la shape, al hacerlo aqui permitimos recursividad en los shapeOr
+        if not self._does_node_conform_to_shape(node, source_schema):
+            print(f"Node '{node}' does not conform to shape {shape_id}. Skipping...")
+            return None
+
         self.nodes_to_copy.append(node)
         print(f"Copying entity {node} with shape '{shape_id}'")
         item_json = self._load_entity_json(self.wbsource_url, node, languages)['entities'][node]
@@ -317,7 +315,6 @@ class WikibaseEngine(object):
         subset_extractor = SubsetExtractorVisitor(self)
         subset_extractor.extract_subset_from_shape(item_json, source_schema, shape_id,
                                                    languages, "", subset)
-        #pdb.set_trace()
         item_id = self.createItem(item_json, languages, deep_copy=True, subset=subset)
         print(f"Finished. Target id of {node} -> {item_id}")
         self.nodes_to_copy.clear()
@@ -366,9 +363,7 @@ class WikibaseEngine(object):
                                  etype='property', subset=subset, property_datatype=property_datatype)
 
     def createEntity(self, wd_json, languages, deep_copy, etype, subset, **kwargs):
-
-        claims, labels, descriptions, source_id = (wd_json['claims'], wd_json['labels'],
-                                                   wd_json['descriptions'], wd_json['id'])
+        claims, source_id = (wd_json['claims'], wd_json['id'])
         print(f"Create entity: {source_id}")
         if self.existsEntity(source_id, etype):
             target_id = self._get_target_id_of(source_id, etype)
@@ -380,14 +375,7 @@ class WikibaseEngine(object):
             return target_id
 
         item = self.local_item_engine(new_item=True)
-        if 'en' not in languages:
-            languages.append('en')
-
-        for language in languages:
-            if language in labels.keys():
-                item.set_label(labels[language]["value"], lang=language)
-            if language in descriptions.keys():
-                item.set_description(descriptions[language]["value"][:250], lang=language)
+        self._add_item_info(item, wd_json, languages)
 
         try:
             new_item_id = item.write(self.login, entity_type=etype, **kwargs)
@@ -417,6 +405,22 @@ class WikibaseEngine(object):
 
     def existsItem(self, source_item_id):
         return self._get_target_id_of(source_item_id, etype='item') is not None
+
+    def _add_item_info(self, item, wd_json, languages):
+        labels, descriptions, aliases = (wd_json['labels'], wd_json['descriptions'],
+            wd_json['aliases'])
+
+        if 'en' not in languages:
+            languages.append('en')
+
+        for language in languages:
+            if language in labels.keys():
+                item.set_label(labels[language]["value"], lang=language)
+            if language in descriptions.keys():
+                item.set_description(descriptions[language]["value"][:250], lang=language)
+            if language in aliases.keys():
+                item_aliases = [alias['value'] for alias in aliases[language]]
+                item.set_aliases(item_aliases, language)
 
     def _add_mapping_to_item(self, item, source_id, etype):
         wd_mapping = wdi_core.WDUrl(value=f"{self.wbsource_url}/entity/"+source_id, prop_nr=self._mappings_prop)
@@ -526,6 +530,14 @@ class WikibaseEngine(object):
             print(f"Not recognized datatype '{datatype}'. Returning None...")
             return None
 
+    def _does_node_conform_to_shape(self, node, json_schema):
+        loader = SchemaLoader()
+        schema = loader.loads(json.dumps(json_schema))
+        source_rdf = f"{self.wbsource_url}/wiki/Special:EntityData/{node}.ttl"
+        eval_result = ShExEvaluator().evaluate(source_rdf, schema,
+                                               focus=f"{self.wbsource_url}/entity/{node}")
+        return eval_result[0].result
+
     def _get_or_create_mappings_prop(self):
         query_res = json.loads(requests.get(f"{self.wbtarget_url}/w/api.php?action=wbsearchentities" + \
             f"&search={self.MAPPINGS_PROP_LABEL}&format=json&language=en&type=property").text)
@@ -594,12 +606,19 @@ class WikibaseEngine(object):
         return self.mappings_cache[source_item_id] if source_item_id in self.mappings_cache else None
 
     def _load_mappings(self):
-        query = f"PREFIX wdt: <{self.wbtarget_url}prop/direct/>"
-        query += "SELECT ?target ?source WHERE { ?target wdt:" + self._mappings_prop + " ?source . }"
+        pdb.set_trace()
+        query = f"PREFIX wdt: <{self.wbtarget_url}/prop/direct/>"
+        query += """
+        SELECT ?target ?source WHERE {{
+            ?target wdt:{} ?source .
+        }}
+        """.format(self._mappings_prop)
         for result in wdi_core.WDItemEngine.execute_sparql_query(query, endpoint=self.wbtarget_sparql)["results"]["bindings"]:
-            source_id = result["source"]["value"].replace(f"{self.wbtarget_url}/entity", "")
-            target_id = result["target"]["value"].replace(f"{self.wbsource_url}/entity", "")
+            source_id = result["source"]["value"].replace(f"{self.wbsource_url}/entity/", "")
+            target_id = result["target"]["value"].replace(f"{self.wbtarget_url}/entity/", "")
             self.mappings_cache[source_id] = target_id
+        pdb.set_trace()
+        print(self.mappings_cache)
 
 
     def getNamespace(self, nsName):
